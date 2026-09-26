@@ -19,12 +19,14 @@ use Laravel\Ai\Events\AgentPrompted;
 use Laravel\Ai\Events\AgentStreamed;
 use Laravel\Ai\Events\InvokingTool;
 use Laravel\Ai\Events\PromptingAgent;
+use Laravel\Ai\Events\StartingStep;
 use Laravel\Ai\Events\StreamingAgent;
 use Laravel\Ai\Events\ToolInvoked;
+use Laravel\Ai\Messages\UserMessage;
 use Laravel\Ai\Prompts\AgentPrompt;
 use Laravel\Ai\Responses\AgentResponse;
 use Laravel\Ai\Responses\Data\Meta;
-use Laravel\Ai\Responses\Data\Usage;
+use Laravel\Ai\Responses\Data\TextUsage;
 use Laravel\Ai\Responses\StreamedAgentResponse;
 
 function makeLangfuseClient(): array
@@ -62,17 +64,47 @@ function makeAgentPrompt(string $model = 'gpt-4', ?Agent $agent = null): AgentPr
 function makeAgentResponse(
     string $invocationId = 'inv-1',
     string $text = 'Hello world',
-    int $promptTokens = 10,
-    int $completionTokens = 20,
+    int $inputTokens = 10,
+    int $outputTokens = 20,
     ?string $model = 'gpt-4',
     ?string $provider = 'openai',
+    ?int $cacheReadInputTokens = null,
 ): AgentResponse {
     return new AgentResponse(
         invocationId: $invocationId,
         text: $text,
-        usage: new Usage(promptTokens: $promptTokens, completionTokens: $completionTokens),
+        usage: new TextUsage(inputTokens: $inputTokens, outputTokens: $outputTokens, cacheReadInputTokens: $cacheReadInputTokens),
         meta: new Meta(provider: $provider, model: $model),
     );
+}
+
+/**
+ * A run's first step starting, after its agent middleware has run: the
+ * messages are the ones the model receives, middleware edits included.
+ *
+ * @param  array<int, mixed>|null  $messages
+ */
+function makeFirstStep(string $invocationId, AgentPrompt $prompt, ?array $messages = null, int $stepNumber = 0): StartingStep
+{
+    return new StartingStep(
+        invocationId: $invocationId,
+        stepNumber: $stepNumber,
+        agent: $prompt->agent,
+        provider: makeTestProvider(),
+        model: $prompt->model,
+        isFinalStep: false,
+        messages: $messages ?? [new UserMessage($prompt->prompt)],
+    );
+}
+
+/**
+ * What laravel/ai 1.0 dispatches as a run starts: PromptingAgent, then the
+ * first step once its middleware has run.
+ */
+function startRun(LaravelAiSubscriber $subscriber, string $invocationId, AgentPrompt $prompt, ?array $messages = null): void
+{
+    $subscriber->handlePromptingAgent(new PromptingAgent(invocationId: $invocationId, prompt: $prompt));
+    $subscriber->handleStartingStep(makeFirstStep($invocationId, $prompt, $messages));
 }
 
 function makeTestAgent(): Agent
@@ -101,6 +133,7 @@ it('registers correct event mappings in subscribe', function () {
     expect($result)->toBe([
         PromptingAgent::class => 'handlePromptingAgent',
         StreamingAgent::class => 'handlePromptingAgent',
+        StartingStep::class => 'handleStartingStep',
         AgentPrompted::class => 'handleAgentPrompted',
         AgentStreamed::class => 'handleAgentPrompted',
         InvokingTool::class => 'handleInvokingTool',
@@ -114,10 +147,7 @@ it('creates trace and generation on agent prompt', function () {
 
     $prompt = makeAgentPrompt();
 
-    $subscriber->handlePromptingAgent(new PromptingAgent(
-        invocationId: 'inv-1',
-        prompt: $prompt,
-    ));
+    startRun($subscriber, 'inv-1', $prompt);
 
     $subscriber->handleAgentPrompted(new AgentPrompted(
         invocationId: 'inv-1',
@@ -139,15 +169,12 @@ it('captures usage data in generation', function () {
 
     $prompt = makeAgentPrompt();
 
-    $subscriber->handlePromptingAgent(new PromptingAgent(
-        invocationId: 'inv-1',
-        prompt: $prompt,
-    ));
+    startRun($subscriber, 'inv-1', $prompt);
 
     $subscriber->handleAgentPrompted(new AgentPrompted(
         invocationId: 'inv-1',
         prompt: $prompt,
-        response: makeAgentResponse(promptTokens: 15, completionTokens: 25),
+        response: makeAgentResponse(inputTokens: 15, outputTokens: 25),
     ));
 
     $updateEvent = collect($batcher->events())->first(
@@ -167,10 +194,7 @@ it('captures model name from response meta', function () {
 
     $prompt = makeAgentPrompt('gpt-4');
 
-    $subscriber->handlePromptingAgent(new PromptingAgent(
-        invocationId: 'inv-1',
-        prompt: $prompt,
-    ));
+    startRun($subscriber, 'inv-1', $prompt);
 
     $subscriber->handleAgentPrompted(new AgentPrompted(
         invocationId: 'inv-1',
@@ -192,10 +216,7 @@ it('creates trace with agent class name', function () {
 
     $prompt = makeAgentPrompt();
 
-    $subscriber->handlePromptingAgent(new PromptingAgent(
-        invocationId: 'inv-1',
-        prompt: $prompt,
-    ));
+    startRun($subscriber, 'inv-1', $prompt);
 
     $traceEvent = collect($batcher->events())->first(
         fn(IngestionEvent $e) => $e->type->value === 'trace-create',
@@ -212,10 +233,7 @@ it('creates trace with correct metadata', function () {
 
     $prompt = makeAgentPrompt('claude-3-opus');
 
-    $subscriber->handlePromptingAgent(new PromptingAgent(
-        invocationId: 'inv-1',
-        prompt: $prompt,
-    ));
+    startRun($subscriber, 'inv-1', $prompt);
 
     $traceEvent = collect($batcher->events())->first(
         fn(IngestionEvent $e) => $e->type->value === 'trace-create',
@@ -230,12 +248,9 @@ it('creates span for tool invocation', function () {
     [$client, $batcher] = makeLangfuseClient();
     $subscriber = new LaravelAiSubscriber($client);
 
-    // First create a trace via agent prompt
+    // First create a trace via the run's first step
     $prompt = makeAgentPrompt();
-    $subscriber->handlePromptingAgent(new PromptingAgent(
-        invocationId: 'inv-1',
-        prompt: $prompt,
-    ));
+    startRun($subscriber, 'inv-1', $prompt);
 
     $agent = makeTestAgent();
     $tool = makeTestTool();
@@ -282,7 +297,7 @@ it('reuses existing trace across multiple prompts', function () {
     $prompt = makeAgentPrompt();
 
     // First prompt
-    $subscriber->handlePromptingAgent(new PromptingAgent(invocationId: 'inv-1', prompt: $prompt));
+    startRun($subscriber, 'inv-1', $prompt);
     $subscriber->handleAgentPrompted(new AgentPrompted(
         invocationId: 'inv-1',
         prompt: $prompt,
@@ -290,7 +305,7 @@ it('reuses existing trace across multiple prompts', function () {
     ));
 
     // Second prompt (same invocation ID pattern, but the trace is set as current)
-    $subscriber->handlePromptingAgent(new PromptingAgent(invocationId: 'inv-2', prompt: $prompt));
+    startRun($subscriber, 'inv-2', $prompt);
     $subscriber->handleAgentPrompted(new AgentPrompted(
         invocationId: 'inv-2',
         prompt: $prompt,
@@ -321,10 +336,7 @@ it('sets current trace on langfuse client', function () {
 
     $prompt = makeAgentPrompt();
 
-    $subscriber->handlePromptingAgent(new PromptingAgent(
-        invocationId: 'inv-1',
-        prompt: $prompt,
-    ));
+    startRun($subscriber, 'inv-1', $prompt);
 
     expect($client->currentTrace())->not->toBeInstanceOf(NullLangfuseTrace::class);
 });
@@ -339,6 +351,7 @@ it('handles streaming events same as non-streaming', function () {
         invocationId: 'inv-1',
         prompt: $prompt,
     ));
+    $subscriber->handleStartingStep(makeFirstStep('inv-1', $prompt));
 
     $subscriber->handleAgentPrompted(new AgentStreamed(
         invocationId: 'inv-1',
@@ -346,7 +359,7 @@ it('handles streaming events same as non-streaming', function () {
         response: new StreamedAgentResponse(
             invocationId: 'inv-1',
             text: 'Streamed response',
-            usage: new Usage(promptTokens: 5, completionTokens: 10),
+            usage: new TextUsage(inputTokens: 5, outputTokens: 10),
             meta: new Meta(provider: 'openai', model: 'gpt-4'),
         ),
     ));
@@ -390,10 +403,7 @@ it('falls back to prompt model when response meta model is null', function () {
 
     $prompt = makeAgentPrompt('claude-3-sonnet');
 
-    $subscriber->handlePromptingAgent(new PromptingAgent(
-        invocationId: 'inv-1',
-        prompt: $prompt,
-    ));
+    startRun($subscriber, 'inv-1', $prompt);
 
     $subscriber->handleAgentPrompted(new AgentPrompted(
         invocationId: 'inv-1',
@@ -415,10 +425,7 @@ it('captures prompt text as generation input', function () {
 
     $prompt = makeAgentPrompt();
 
-    $subscriber->handlePromptingAgent(new PromptingAgent(
-        invocationId: 'inv-1',
-        prompt: $prompt,
-    ));
+    startRun($subscriber, 'inv-1', $prompt);
 
     $subscriber->handleAgentPrompted(new AgentPrompted(
         invocationId: 'inv-1',
@@ -440,10 +447,7 @@ it('captures response text as generation output', function () {
 
     $prompt = makeAgentPrompt();
 
-    $subscriber->handlePromptingAgent(new PromptingAgent(
-        invocationId: 'inv-1',
-        prompt: $prompt,
-    ));
+    startRun($subscriber, 'inv-1', $prompt);
 
     $subscriber->handleAgentPrompted(new AgentPrompted(
         invocationId: 'inv-1',
@@ -457,4 +461,74 @@ it('captures response text as generation output', function () {
     $body = $updateEvent->body->toArray();
 
     expect($body['output'])->toBe('Why did the chicken cross the road?');
+});
+
+// =========================================================================
+// laravel/ai 1.0: agent middleware wraps each generation step
+// =========================================================================
+
+it('opens no trace until the run\'s first step starts', function () {
+    [$client, $batcher] = makeLangfuseClient();
+    $subscriber = new LaravelAiSubscriber($client);
+
+    $subscriber->handlePromptingAgent(new PromptingAgent(invocationId: 'inv-1', prompt: makeAgentPrompt()));
+
+    expect($batcher->events())->toBeEmpty()
+        ->and($client->currentTrace())->toBeInstanceOf(NullLangfuseTrace::class);
+});
+
+it('binds a run to the trace the application opened in its first step\'s middleware', function () {
+    [$client, $batcher] = makeLangfuseClient();
+    $subscriber = new LaravelAiSubscriber($client);
+    $prompt = makeAgentPrompt();
+
+    $subscriber->handlePromptingAgent(new PromptingAgent(invocationId: 'inv-1', prompt: $prompt));
+
+    // The application's step middleware opens its own trace for the turn,
+    // after PromptingAgent and before the step starts.
+    $appTrace = $client->trace(new \Axyr\Langfuse\Dto\TraceBody(name: 'app-turn'));
+    $client->setCurrentTrace($appTrace);
+
+    $subscriber->handleStartingStep(makeFirstStep('inv-1', $prompt));
+    $subscriber->handleAgentPrompted(new AgentPrompted(invocationId: 'inv-1', prompt: $prompt, response: makeAgentResponse()));
+
+    $traces = collect($batcher->events())->filter(fn(IngestionEvent $e) => $e->type->value === 'trace-create');
+    $generation = collect($batcher->events())->first(fn(IngestionEvent $e) => $e->type->value === 'generation-create');
+
+    expect($traces)->toHaveCount(1)
+        ->and($traces->first()->body->toArray()['name'])->toBe('app-turn')
+        ->and($generation->body->toArray()['traceId'])->toBe($traces->first()->body->toArray()['id']);
+});
+
+it('records the user message the model received on the first step as the generation input', function () {
+    [$client, $batcher] = makeLangfuseClient();
+    $subscriber = new LaravelAiSubscriber($client);
+    $prompt = makeAgentPrompt();
+
+    // laravel/ai 1.0's AgentPrompted carries the prompt as passed in; the
+    // model got it with the middleware's additions.
+    startRun($subscriber, 'inv-1', $prompt, [new UserMessage("# Knowledge\n\nJokes are allowed.\n\nTell me a joke")]);
+    $subscriber->handleStartingStep(makeFirstStep('inv-1', $prompt, [new UserMessage('a later step')], stepNumber: 1));
+    $subscriber->handleAgentPrompted(new AgentPrompted(invocationId: 'inv-1', prompt: $prompt, response: makeAgentResponse()));
+
+    $generation = collect($batcher->events())->first(fn(IngestionEvent $e) => $e->type->value === 'generation-create');
+
+    expect($generation->body->toArray()['input'])->toBe("# Knowledge\n\nJokes are allowed.\n\nTell me a joke");
+});
+
+it('reports input tokens without cache reads, as laravel/ai 0.x did', function () {
+    [$client, $batcher] = makeLangfuseClient();
+    $subscriber = new LaravelAiSubscriber($client);
+    $prompt = makeAgentPrompt();
+
+    startRun($subscriber, 'inv-1', $prompt);
+    $subscriber->handleAgentPrompted(new AgentPrompted(
+        invocationId: 'inv-1',
+        prompt: $prompt,
+        response: makeAgentResponse(inputTokens: 250, outputTokens: 30, cacheReadInputTokens: 50),
+    ));
+
+    $update = collect($batcher->events())->first(fn(IngestionEvent $e) => $e->type->value === 'generation-update');
+
+    expect($update->body->toArray()['usage'])->toBe(['input' => 200, 'output' => 30, 'total' => 230]);
 });

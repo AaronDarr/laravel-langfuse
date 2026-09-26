@@ -7,10 +7,7 @@ namespace Laravel\Ai\Responses\Data;
 class Usage
 {
     public function __construct(
-        public int $promptTokens = 0,
-        public int $completionTokens = 0,
-        public int $cacheWriteInputTokens = 0,
-        public int $cacheReadInputTokens = 0,
-        public int $reasoningTokens = 0,
+        public int $inputTokens = 0,
+        public int $outputTokens = 0,
     ) {}
 }

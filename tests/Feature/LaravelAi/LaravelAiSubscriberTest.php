@@ -64,13 +64,23 @@ it('dispatches events through subscriber when enabled', function () {
         prompt: $prompt,
     ));
 
+    event(new \Laravel\Ai\Events\StartingStep(
+        invocationId: 'inv-1',
+        stepNumber: 0,
+        agent: $agent,
+        provider: $textProvider,
+        model: 'gpt-4',
+        isFinalStep: false,
+        messages: [new \Laravel\Ai\Messages\UserMessage('Hello AI')],
+    ));
+
     event(new \Laravel\Ai\Events\AgentPrompted(
         invocationId: 'inv-1',
         prompt: $prompt,
         response: new \Laravel\Ai\Responses\AgentResponse(
             invocationId: 'inv-1',
             text: 'Hello human',
-            usage: new \Laravel\Ai\Responses\Data\Usage(promptTokens: 10, completionTokens: 20),
+            usage: new \Laravel\Ai\Responses\Data\TextUsage(inputTokens: 10, outputTokens: 20),
             meta: new \Laravel\Ai\Responses\Data\Meta(provider: 'openai', model: 'gpt-4'),
         ),
     ));
@@ -118,8 +128,17 @@ it('dispatches tool events through subscriber', function () {
         model: 'gpt-4',
     );
 
-    // Agent prompt first (creates trace)
+    // Agent prompt, then its first step (creates the trace)
     event(new \Laravel\Ai\Events\PromptingAgent(invocationId: 'inv-1', prompt: $prompt));
+    event(new \Laravel\Ai\Events\StartingStep(
+        invocationId: 'inv-1',
+        stepNumber: 0,
+        agent: $agent,
+        provider: $textProvider,
+        model: 'gpt-4',
+        isFinalStep: false,
+        messages: [new \Laravel\Ai\Messages\UserMessage('Search for something')],
+    ));
 
     // Tool invocation
     event(new \Laravel\Ai\Events\InvokingTool(
