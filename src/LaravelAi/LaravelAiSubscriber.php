@@ -50,10 +50,11 @@ class LaravelAiSubscriber
     ) {}
 
     /**
-     * Only starts the clock. laravel/ai 1.0 runs agent middleware around each
-     * generation step, AFTER this event — so a trace that middleware opens does
-     * not exist yet, and resolving one here would open a second trace for the
-     * same run. The run is bound on its first step instead.
+     * Starts a fallback clock only. laravel/ai 1.0 runs agent middleware around
+     * each generation step, AFTER this event — so a trace that middleware opens
+     * does not exist yet, and resolving one here would open a second trace for
+     * the same run. The run is bound, and its clock restarted, on its first
+     * step instead.
      */
     public function handlePromptingAgent(PromptingAgent $event): void
     {
@@ -72,6 +73,15 @@ class LaravelAiSubscriber
         if ($event->stepNumber !== 0) {
             return;
         }
+
+        // A provider failover retries the same invocation as a new run, which
+        // starts here again: drop the binding the failed attempt left, so the
+        // retry nests under the trace that is current now.
+        unset($this->traces[$event->invocationId]);
+
+        // The generation's clock starts here, not on PromptingAgent: the
+        // application's step middleware (retrieval, say) ran in between.
+        $this->startTimes[$event->invocationId] = microtime(true);
 
         $input = $this->currentMessage($event->messages);
 
@@ -230,9 +240,9 @@ class LaravelAiSubscriber
 
     /**
      * laravel/ai 1.0 counts cache reads and writes inside `inputTokens`. They
-     * are left out here, as laravel/ai 0.x's `promptTokens` left them out:
-     * this Usage has no field for cached tokens, and Langfuse would price them
-     * at the full input rate.
+     * are left out here, as 0.x's OpenAI and Anthropic gateways left them out
+     * of `promptTokens`: this Usage has no field for cached tokens, and
+     * Langfuse would price them at the full input rate.
      */
     private function mapUsage(\Laravel\Ai\Responses\Data\Usage $usage): Usage
     {

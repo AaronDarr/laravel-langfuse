@@ -532,3 +532,44 @@ it('reports input tokens without cache reads, as laravel/ai 0.x did', function (
 
     expect($update->body->toArray()['usage'])->toBe(['input' => 200, 'output' => 30, 'total' => 230]);
 });
+
+it('binds a failover retry to the trace its own first step opened', function () {
+    [$client, $batcher] = makeLangfuseClient();
+    $subscriber = new LaravelAiSubscriber($client);
+    $prompt = makeAgentPrompt();
+
+    // Attempt 1: the application's step middleware opens a trace, the step
+    // starts, then the provider fails over. laravel/ai keeps the invocation id.
+    $client->setCurrentTrace($client->trace(new \Axyr\Langfuse\Dto\TraceBody(name: 'attempt-1')));
+    startRun($subscriber, 'inv-1', $prompt);
+
+    // Attempt 2: fresh middleware opens another trace; the same id starts again.
+    $retryTrace = $client->trace(new \Axyr\Langfuse\Dto\TraceBody(name: 'attempt-2'));
+    $client->setCurrentTrace($retryTrace);
+    startRun($subscriber, 'inv-1', $prompt);
+    $subscriber->handleAgentPrompted(new AgentPrompted(invocationId: 'inv-1', prompt: $prompt, response: makeAgentResponse()));
+
+    $traceIds = collect($batcher->events())
+        ->filter(fn(IngestionEvent $e) => $e->type->value === 'trace-create')
+        ->mapWithKeys(fn(IngestionEvent $e) => [$e->body->toArray()['name'] => $e->body->toArray()['id']]);
+    $generation = collect($batcher->events())->first(fn(IngestionEvent $e) => $e->type->value === 'generation-create');
+
+    expect($generation->body->toArray()['traceId'])->toBe($traceIds['attempt-2']);
+});
+
+it('starts the generation clock on the first step, after the application\'s step middleware', function () {
+    [$client, $batcher] = makeLangfuseClient();
+    $subscriber = new LaravelAiSubscriber($client);
+    $prompt = makeAgentPrompt();
+
+    $subscriber->handlePromptingAgent(new PromptingAgent(invocationId: 'inv-1', prompt: $prompt));
+    usleep(20_000); // the step middleware's work, e.g. retrieval
+    $firstStepAt = microtime(true);
+    $subscriber->handleStartingStep(makeFirstStep('inv-1', $prompt));
+    $subscriber->handleAgentPrompted(new AgentPrompted(invocationId: 'inv-1', prompt: $prompt, response: makeAgentResponse()));
+
+    $generation = collect($batcher->events())->first(fn(IngestionEvent $e) => $e->type->value === 'generation-create');
+    $startTime = DateTimeImmutable::createFromFormat('Y-m-d\\TH:i:s.u\\Z', $generation->body->toArray()['startTime'], new DateTimeZone('UTC'));
+
+    expect((float) $startTime->format('U.u'))->toBeGreaterThanOrEqual(floor($firstStepAt * 1_000_000) / 1_000_000);
+});
